@@ -1,8 +1,24 @@
 # frostfire
 
-frostfire is an embedded, ACID-compliant key/value store written in Go. It supports a single writer and many concurrent readers, with each reader observing a consistent snapshot of the database.
+frostfire is an embedded, ACID-compliant key/value store written in Go. It runs in-process against a single file, exposing an transactional API over a copy-on-write B+tree.
 
 Requirements: Go 1.25 or later, on Linux or macOS.
+
+## Design
+
+frostfire is inspired from [LMDB](http://www.lmdb.tech/doc/) and [boltdb](https://github.com/boltdb/bolt): a single-file embedded store, one writer at a time, lock-free snapshot reads, and data laid out as a copy-on-write B+tree of fixed-size pages.
+
+### Buffer pool with direct I/O
+
+LMDB and boltdb both rely on `mmap` and let the kernel page cache do the buffering. frostfire instead manages its own buffer pool in user space and reads/writes pages through direct I/O (`O_DIRECT` on Linux, `F_NOCACHE` on macOS), bypassing the page cache entirely.
+
+### Copy-on-write B+tree
+
+Updates never overwrite a live page. A write transaction copies any page it touches into a fresh page, propagates the new page id up to the root, and commits by atomically swapping the meta page that names the new root. Two meta pages alternate, so a crash mid-commit always leaves at least one intact root to recover from.
+
+This gives readers their snapshots for free: a read transaction captures a meta page on entry and walks the tree rooted there. The writer can do whatever it likes to newer pages without disturbing it.
+
+The result is no in-place updates, no write-ahead log, and no locks on the read path.
 
 ## Installation
 

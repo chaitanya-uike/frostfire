@@ -1,0 +1,7 @@
+go.work
+go.work.sum
+
+.DS_Store
+
+/bin/
+*.db

@@ -43,6 +43,7 @@ func alignment(buf []byte) int {
 	return int(uintptr(unsafe.Pointer(&buf[0])) & uintptr(AlignSize-1))
 }
 
+// for direct io buffers need to be block aligned
 func NewBuffer() []byte {
 	buf := make([]byte, PageSize+AlignSize)
 	a := alignment(buf)

@@ -343,6 +343,33 @@ type dirtyFrame struct {
 	frame  *Page
 }
 
+func (p *BufferPool) FlushPages(ids []PageId) error {
+	dirty := make([]dirtyFrame, 0, len(ids))
+	for _, pageId := range ids {
+		shard := p.getShard(pageId)
+		shard.mu.Lock()
+		frame, ok := shard.m[pageId]
+		if !ok {
+			shard.mu.Unlock()
+			continue
+		}
+		frame.mu.Lock()
+		shard.mu.Unlock()
+
+		if frame.state != Ready || !frame.dirty {
+			frame.mu.Unlock()
+			continue
+		}
+		dirty = append(dirty, dirtyFrame{
+			pageId: pageId,
+			data:   frame.data,
+			frame:  frame,
+		})
+		frame.mu.Unlock()
+	}
+	return p.flushDirty(dirty)
+}
+
 func (p *BufferPool) FlushAll() error {
 	dirty := make([]dirtyFrame, 0, len(p.frames))
 	for _, frame := range p.frames {
@@ -358,7 +385,10 @@ func (p *BufferPool) FlushAll() error {
 		})
 		frame.mu.Unlock()
 	}
+	return p.flushDirty(dirty)
+}
 
+func (p *BufferPool) flushDirty(dirty []dirtyFrame) error {
 	sort.Slice(dirty, func(i, j int) bool {
 		return dirty[i].pageId < dirty[j].pageId
 	})
@@ -385,6 +415,20 @@ func (p *BufferPool) FlushAll() error {
 	return nil
 }
 
+func (p *BufferPool) MarkClean(pageID PageId) {
+	shard := p.getShard(pageID)
+	shard.mu.Lock()
+	frame, ok := shard.m[pageID]
+	if !ok {
+		shard.mu.Unlock()
+		return
+	}
+	frame.mu.Lock()
+	shard.mu.Unlock()
+	frame.dirty = false
+	frame.mu.Unlock()
+}
+
 func (pg *Page) Unpin() {
 	pg.mu.Lock()
 	if pg.pinCount <= 0 {
@@ -393,4 +437,17 @@ func (pg *Page) Unpin() {
 	}
 	pg.pinCount--
 	pg.mu.Unlock()
+}
+
+func (p *BufferPool) Sync() error {
+	return p.sm.Sync()
+}
+
+func (p *BufferPool) Close() error {
+	flushErr := p.FlushAll()
+	closeErr := p.sm.Close()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
 }

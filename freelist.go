@@ -13,7 +13,7 @@ func newFreelist() *freelist {
 	return &freelist{}
 }
 
-func (f *freelist) pushMany(ids []PageId, freedAt TxnID) {
+func (f *freelist) push(freedAt TxnID, ids ...PageId) {
 	for _, id := range ids {
 		f.pending = append(f.pending, freelistEntry{pageID: id, freedAt: freedAt})
 	}

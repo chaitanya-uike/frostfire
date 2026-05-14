@@ -165,8 +165,8 @@ func (t *Txn) Commit() error {
 		return err
 	}
 
-	t.db.freelist.pushMany(t.freed, t.meta.txnID)
-	t.db.freelist.pushMany(t.reusable, t.meta.txnID)
+	t.db.freelist.push(t.meta.txnID, t.freed...)
+	t.db.freelist.push(t.meta.txnID, t.reusable...)
 
 	t.closed = true
 	t.db.writerMu.Unlock()

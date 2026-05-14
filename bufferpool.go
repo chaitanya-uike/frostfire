@@ -5,12 +5,10 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -42,10 +40,14 @@ type PageTable struct {
 	m  map[PageId]*Page
 }
 
+type loadingEntry struct {
+	done chan struct{}
+}
+
 type BufferPool struct {
 	frames    []Page
 	shards    [tableShards]PageTable
-	loading   singleflight.Group
+	loading   sync.Map // PageId -> *loadingEntry
 	clockHand atomic.Uint32
 	sm        *StorageManager
 }
@@ -110,25 +112,32 @@ func (bp *BufferPool) Get(pageId PageId) (*Page, error) {
 		}
 		pageTable.mu.Unlock()
 
-		_, err, _ := bp.loading.Do(strconv.FormatUint(uint64(pageId), 10), func() (any, error) {
-			pageTable := bp.getPageTable(pageId)
-			pageTable.mu.Lock()
-			if _, ok := pageTable.m[pageId]; ok {
-				pageTable.mu.Unlock()
-				return nil, nil
-			}
-			pageTable.mu.Unlock()
+		entry, loaded := bp.loading.LoadOrStore(pageId, &loadingEntry{done: make(chan struct{})})
+		if loaded {
+			<-entry.(*loadingEntry).done
+			continue
+		}
 
-			page, err := bp.loadAndInstall(pageId)
-			if err != nil {
-				return nil, err
-			}
-			page.Unpin()
-			return nil, nil
-		})
+		loader := entry.(*loadingEntry)
+		// We may have missed the page before a previous loader installed it.
+		// Recheck before doing disk I/O to avoid duplicate loads.
+		pageTable = bp.getPageTable(pageId)
+		pageTable.mu.Lock()
+		if _, ok := pageTable.m[pageId]; ok {
+			pageTable.mu.Unlock()
+			close(loader.done)
+			bp.loading.Delete(pageId)
+			continue
+		}
+		pageTable.mu.Unlock()
+
+		page, err := bp.loadAndInstall(pageId)
+		close(loader.done)
+		bp.loading.Delete(pageId)
 		if err != nil {
 			return nil, err
 		}
+		return page, nil
 	}
 }
 
@@ -368,6 +377,8 @@ func (bp *BufferPool) acquireFrame() (*Page, error) {
 		victim.mu.Unlock()
 
 		if dirty {
+			// Keep the old page mapped while writing it back so concurrent
+			// readers get the latest in-memory bytes, not stale disk bytes.
 			if err := bp.sm.WritePage(oldPageId, victim.data); err != nil {
 				victim.mu.Lock()
 				victim.evicting = false

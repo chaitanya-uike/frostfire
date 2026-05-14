@@ -6,20 +6,6 @@ copy-on-write B+tree.
 
 Requirements: Go 1.25 or later, on Linux or macOS.
 
-## Mental Model
-
-Immutable Datastructures: The important idea is that updates do not overwrite pages that a reader might still be using. A write transaction copies the pages it changes, updates parent
-pages to point at those copies, and eventually publishes a new root page by
-writing a new meta page. Readers keep walking the root they saw when their
-transaction began.
-
-That gives Frostfire a simple shape:
-
-- readers get stable snapshots,
-- one writer builds the next version of the tree,
-- old pages become reusable only when no active reader can still see them,
-- commit publishes the new version durably.
-
 ## Installation
 
 ```sh
@@ -212,6 +198,21 @@ Frostfire is inspired by [LMDB](http://www.lmdb.tech/doc/) and
 [BoltDB](https://github.com/boltdb/bolt): a single-file embedded store, one
 writer at a time, snapshot reads, and data laid out as a copy-on-write B+tree of
 fixed-size pages.
+
+### Mental Model
+
+Immutable Datastructures: The important idea is that updates do not overwrite
+pages that a reader might still be using. A write transaction copies the pages it
+changes, updates parent pages to point at those copies, and eventually publishes
+a new root page by writing a new meta page. Readers keep walking the root they
+saw when their transaction began.
+
+That gives Frostfire a simple shape:
+
+- readers get stable snapshots,
+- one writer builds the next version of the tree,
+- old pages become reusable only when no active reader can still see them,
+- commit publishes the new version durably.
 
 ### Copy-On-Write B+tree
 

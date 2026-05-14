@@ -159,6 +159,8 @@ func (t *BTree) delete(node *bnode, key []byte) (*bnode, bool, error) {
 		rightSibling.Unpin()
 	}
 
+	// Neither sibling can donate, so merge with one neighbor and remove the
+	// separator that used to sit between them.
 	if childIdx > 0 {
 		leftPageID := node.child(childIdx - 1)
 		leftSibling, err := t.get(leftPageID)
@@ -221,6 +223,8 @@ func siblingCanDonate(sibling *bnode) bool {
 	return used-borrowSize-2 >= PageSize/4
 }
 
+// Rebuild the parent after a borrow. sepKey is the new boundary between the
+// repaired left and right children.
 func (t *BTree) rebuildParentForBorrow(node *bnode, sepIdx uint16, leftChildID PageId, sepKey []byte, rightChildID PageId) (*bnode, error) {
 	dst, err := t.allocInternal()
 	if err != nil {
@@ -252,6 +256,8 @@ func (t *BTree) borrowFromLeftLeaf(leftSibling, child *bnode) (*bnode, []byte, e
 }
 
 func (t *BTree) borrowFromLeftInternal(leftSibling *bnode, parentSepKey []byte, child *bnode) (*bnode, []byte, error) {
+	// Internal borrow rotates through the parent: left's largest separator
+	// moves up, and the old parent separator moves down into child.
 	borrowIdx := leftSibling.nCells() - 1
 	pulledUpKey := append([]byte(nil), leftSibling.key(borrowIdx)...)
 	pushedDownChild := leftSibling.rightmostChild()
@@ -280,6 +286,8 @@ func (t *BTree) borrowFromRightLeaf(rightSibling, child *bnode) (*bnode, []byte,
 }
 
 func (t *BTree) borrowFromRightInternal(rightSibling *bnode, parentSepKey []byte, child *bnode) (*bnode, []byte, error) {
+	// The old parent separator moves down,
+	// and right's smallest separator replaces it in the parent.
 	pulledUpKey := append([]byte(nil), rightSibling.key(0)...)
 	pushedDownChild := child.rightmostChild()
 	newChildRightmost := rightSibling.child(0)
@@ -310,6 +318,8 @@ func (t *BTree) mergeWithLeft(leftSibling *bnode, parentSepKey []byte, child *bn
 
 	merged.copyRange(leftSibling, 0, leftSibling.nCells())
 	if !isLeaf {
+		// Internal merges pull the parent separator down between the two
+		// children.
 		merged.appendInternalCell(leftSibling.rightmostChild(), parentSepKey)
 	}
 	merged.copyRange(child, 0, child.nCells())
@@ -344,6 +354,8 @@ func (t *BTree) mergeWithRight(child, rightSibling *bnode, parentSepKey []byte) 
 }
 
 func (t *BTree) rebuildParentForMerge(node *bnode, sepIdx uint16, mergedID PageId) (*bnode, error) {
+	// Drop sepIdx from the parent and replace the two children around it with
+	// the single merged child.
 	dst, err := t.allocInternal()
 	if err != nil {
 		return nil, err

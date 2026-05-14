@@ -2,6 +2,40 @@ package frostfire
 
 import "encoding/binary"
 
+// B-tree pages use slotted page format. A fixed header and a growing array of
+// 2-byte cell offsets live at the front of the page. Variable sized cells are
+// packed from the end of the page backward. firstCellOffset points at the
+// lowest-addressed cell payload, so free space is the gap between the offset
+// array and the cell area.
+//
+// Leaf page:
+//
+//	+---------+----------+-----------------+------------------+------+------+
+//	| byte 0  | bytes 1-2| bytes 3-4       | 2B offsets ...   | free | cells|
+//	| type=2  | nCells   | firstCellOffset | one per cell     | gap  | ...  |
+//	+---------+----------+-----------------+------------------+------+------+
+//
+// Leaf cell:
+//
+//	+----------+----------+----------+---------+---------------------------+
+//	| bytes 0-1| bytes 2-3| byte 4   | key     | value or overflow page id |
+//	| keyLen   | valueLen | overflow | keyLenB | valueLenB inline, or 8B   |
+//	+----------+----------+----------+---------+---------------------------+
+//
+// Internal page:
+//
+//	+---------+----------+-----------------+----------------+---------+------+------+
+//	| byte 0  | bytes 1-2| bytes 3-4       | bytes 5-12     | offsets | free | cells|
+//	| type=1  | nCells   | firstCellOffset | rightmostChild | 2B each | gap  | ...  |
+//	+---------+----------+-----------------+----------------+---------+------+------+
+//
+// Internal cell:
+//
+//	+-----------+----------+---------+
+//	| bytes 0-7 | bytes 8-9| key     |
+//	| leftChild | keyLen   | keyLenB |
+//	+-----------+----------+---------+
+
 const (
 	nodeInternal uint8 = 1
 	nodeLeaf     uint8 = 2

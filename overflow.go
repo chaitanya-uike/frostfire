@@ -2,6 +2,17 @@ package frostfire
 
 import "encoding/binary"
 
+// Overflow pages store large leaf values that do not fit inline in a leaf
+// cell. A leaf cell stores the original value length plus the first overflow
+// page id; the pages form a singly-linked list. The last page has next=0.
+//
+//	+---------+-----------+-------------------------------+
+//	| byte 0  | bytes 1-8 | bytes 9..PageSize-1           |
+//	| type=3  | next page | value bytes, up to 4087 bytes |
+//	+---------+-----------+-------------------------------+
+//
+// The total value length is stored in the leaf cell
+
 const (
 	overflowHeaderSize = 9
 	overflowChunkSize  = PageSize - overflowHeaderSize

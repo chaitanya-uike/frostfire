@@ -7,6 +7,26 @@ import (
 	"hash/crc64"
 )
 
+// Meta is the main database header. It is stored in two alternating pages
+// (0 and 1); the newer valid page by txnID wins on load.
+//
+// Only the first metaSize bytes are used today:
+//
+//	+-----------+-----------+-----------+-----------+
+//	| bytes 0-3 | bytes 4-7 | bytes 8-11| bytes12-15|
+//	| magic     | version   | pageSize  | padding   |
+//	+-----------+-----------+-----------+-----------+
+//	| bytes16-23| bytes24-31| bytes32-39| bytes40-47|
+//	| txnID     | catalog   | freelist  | numPages  |
+//	|           | root page | root page |           |
+//	+-----------+-----------+-----------+-----------+
+//	| bytes48-55|
+//	| crc64     |
+//	+-----------+
+//
+// The checksum covers bytes 0..47. The rest of the physical page is currently
+// unused.
+
 const (
 	metaMagic    uint32 = 0x46495245 // "FIRE"
 	metaVersion  uint32 = 1
@@ -21,8 +41,6 @@ var (
 	crcTable       = crc64.MakeTable(crc64.ISO)
 )
 
-// Meta is the main database header. Stored in two
-// alternating pages (0 and 1); the newer one (by txnID) wins on load.
 type Meta struct {
 	magic        uint32
 	version      uint32

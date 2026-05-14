@@ -5,6 +5,17 @@ import (
 	"fmt"
 )
 
+// Freelist is presisted as a singly-linked chain of pages. Meta.freelistRoot
+// points at the first page, and each page carries up to freelistPerPage page
+// ids that may be reused by future write transactions.
+//
+//	+-----------+-----------+-----------+----------------------------+
+//	| bytes 0-7 | bytes 8-11| bytes12-15| bytes 16..PageSize-1       |
+//	| next page | id count  | padding   | count little-endian PageId |
+//	+-----------+-----------+-----------+----------------------------+
+//
+// next page is 0 at the end of the chain.
+
 const (
 	freelistPageHeader = 16 // 8B nextPageId + 4B count + 4B pad
 	freelistPerPage    = (PageSize - freelistPageHeader) / 8

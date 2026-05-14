@@ -1,6 +1,6 @@
-# frostfire
+# Frostfire
 
-frostfire is an embedded, ACID-compliant key/value store written in Go. It runs in-process against a single file, exposing an transactional API over a copy-on-write B+tree.
+Frostfire is an embedded, ACID-compliant key/value store written in Go. It runs in-process against a single file, exposing an transactional API over a copy-on-write B+tree.
 
 Requirements: Go 1.25 or later, on Linux or macOS.
 

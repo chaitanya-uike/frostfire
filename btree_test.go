@@ -162,7 +162,7 @@ func assertValidBtree(t *testing.T, bt *BTree) {
 func assertAllUnpinned(t *testing.T, db *DB) {
 	t.Helper()
 	for i := range db.bufferPool.frames {
-		f := db.bufferPool.frames[i]
+		f := &db.bufferPool.frames[i]
 		if pins := f.pinCount; pins != 0 {
 			t.Errorf("frame for page %d has pins=%d, expected 0", f.pageId, pins)
 		}

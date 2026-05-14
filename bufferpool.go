@@ -1,453 +1,438 @@
 package frostfire
 
 import (
+	"cmp"
+	"context"
 	"errors"
-	"sort"
+	"slices"
+	"strconv"
 	"sync"
-)
+	"sync/atomic"
 
-type PageState uint8
-
-const (
-	Empty PageState = iota
-	Loading
-	Ready
-	Evicting
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	maxRefCount = 5
-	tableShards = 64
-	freePageId  = PageId(^uint64(0))
+	tableShards         = 128
+	maxUsageCount       = 5
+	maxFlushConcurrency = 16
+	freePageId          = PageId(^uint64(0))
 )
 
 var (
 	ErrBufferExhausted = errors.New("BufferPool: no unpinned buffers available")
+	ErrInvalidWrite    = errors.New("BufferPool: cannot write over pinned or evicting page")
 )
 
 type Page struct {
-	pageId PageId
-
-	state PageState
-
-	data []byte
-
-	pinCount int32
-	refCount int32
-	dirty    bool
-
 	mu sync.Mutex
 
-	// condition var to signal loading and eviction state waiters
-	c sync.Cond
+	pageId PageId
+	data   []byte
+
+	pinCount   int32
+	usageCount int32
+	dirty      bool
+	evicting   bool
 }
 
-type Shard struct {
+type PageTable struct {
 	mu sync.Mutex
 	m  map[PageId]*Page
 }
 
 type BufferPool struct {
-	frames    []*Page
-	pageTable [tableShards]*Shard
+	frames    []Page
+	shards    [tableShards]PageTable
+	loading   singleflight.Group
+	clockHand atomic.Uint32
+	sm        *StorageManager
+}
 
-	clockHand int
-	mu        sync.Mutex
+func (p *Page) ID() PageId {
+	return p.pageId
+}
 
-	sm *StorageManager
+func (p *Page) Data() []byte {
+	return p.data
+}
+
+func (p *Page) Unpin() {
+	p.mu.Lock()
+	if p.pinCount <= 0 {
+		p.mu.Unlock()
+		panic("bufferpool: Release on page with pinCount <= 0")
+	}
+	p.pinCount--
+	p.mu.Unlock()
+}
+
+func (p *Page) Release() {
+	p.Unpin()
 }
 
 func NewBufferPool(sm *StorageManager, size int) *BufferPool {
-	frames := make([]*Page, size)
-	for i := range size {
-		page := &Page{
-			pageId: freePageId,
-			state:  Empty,
-			data:   NewBuffer(),
-		}
-		page.c = *sync.NewCond(&page.mu)
-		frames[i] = page
+	bp := &BufferPool{
+		frames: make([]Page, size),
+		sm:     sm,
 	}
-	p := &BufferPool{
-		frames:    frames,
-		pageTable: [tableShards]*Shard{},
-		sm:        sm,
+
+	for i := range bp.frames {
+		f := &bp.frames[i]
+		f.pageId = freePageId
+		f.data = NewBuffer()
 	}
-	for i := range tableShards {
-		p.pageTable[i] = &Shard{m: map[PageId]*Page{}}
+
+	for i := range bp.shards {
+		bp.shards[i].m = make(map[PageId]*Page)
 	}
-	return p
+
+	return bp
 }
 
-func (p *BufferPool) getShard(pageId PageId) *Shard {
-	return p.pageTable[pageId%tableShards]
+func (bp *BufferPool) getPageTable(pageId PageId) *PageTable {
+	return &bp.shards[pageId%tableShards]
 }
 
-func (p *BufferPool) Get(pageId PageId) (*Page, error) {
+func (bp *BufferPool) Get(pageId PageId) (*Page, error) {
 	for {
-		shard := p.getShard(pageId)
+		pageTable := bp.getPageTable(pageId)
+		pageTable.mu.Lock()
+		if frame, ok := pageTable.m[pageId]; ok {
+			frame.mu.Lock()
+			pageTable.mu.Unlock()
 
-		shard.mu.Lock()
-		if exPage, ok := shard.m[pageId]; ok {
-			exPage.mu.Lock()
-			shard.mu.Unlock()
-
-			switch exPage.state {
-			case Ready:
-				exPage.pinCount++
-				exPage.refCount = maxRefCount
-				exPage.mu.Unlock()
-				return exPage, nil
-
-			case Loading:
-				for exPage.state == Loading {
-					exPage.c.Wait()
-				}
-
-				if exPage.state != Ready {
-					exPage.mu.Unlock()
-					continue
-				}
-				exPage.pinCount++
-				exPage.refCount = maxRefCount
-				exPage.mu.Unlock()
-				return exPage, nil
-
-			case Evicting:
-				for exPage.state == Evicting {
-					exPage.c.Wait()
-				}
-				exPage.mu.Unlock()
-				continue
-
-			default:
-				exPage.mu.Unlock()
-				panic("bufferpool: invalid state for a frame in pageTable")
-			}
+			frame.pinCount++
+			frame.usageCount = maxUsageCount
+			frame.mu.Unlock()
+			return frame, nil
 		}
-		shard.mu.Unlock()
+		pageTable.mu.Unlock()
 
-		frame, err := p.acquireFrame()
+		_, err, _ := bp.loading.Do(strconv.FormatUint(uint64(pageId), 10), func() (any, error) {
+			pageTable := bp.getPageTable(pageId)
+			pageTable.mu.Lock()
+			if _, ok := pageTable.m[pageId]; ok {
+				pageTable.mu.Unlock()
+				return nil, nil
+			}
+			pageTable.mu.Unlock()
+
+			page, err := bp.loadAndInstall(pageId)
+			if err != nil {
+				return nil, err
+			}
+			page.Unpin()
+			return nil, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-
-		shard.mu.Lock()
-		if exPage, ok := shard.m[pageId]; ok {
-			frame.pinCount = 0
-			frame.mu.Unlock()
-			exPage.mu.Lock()
-			shard.mu.Unlock()
-
-			if exPage.state == Ready {
-				exPage.pinCount++
-				exPage.refCount = maxRefCount
-				exPage.mu.Unlock()
-				return exPage, nil
-			}
-			exPage.mu.Unlock()
-			continue
-		}
-
-		frame.pageId = pageId
-		frame.state = Loading
-		shard.m[pageId] = frame
-		shard.mu.Unlock()
-
-		data := frame.data
-		frame.mu.Unlock()
-
-		readErr := p.sm.ReadPage(pageId, data)
-
-		frame.mu.Lock()
-		if readErr != nil {
-			shard.mu.Lock()
-			delete(shard.m, pageId)
-			shard.mu.Unlock()
-
-			frame.pageId = freePageId
-			frame.state = Empty
-			frame.pinCount = 0
-			frame.refCount = 0
-			frame.c.Broadcast()
-			frame.mu.Unlock()
-			return nil, readErr
-		}
-
-		frame.state = Ready
-		frame.c.Broadcast()
-		frame.mu.Unlock()
-		return frame, nil
 	}
 }
 
-func (p *BufferPool) AllocatePage(pageId PageId) (*Page, error) {
-	if err := p.sm.Allocate(pageId); err != nil {
-		return nil, err
-	}
-	return p.GetForWrite(pageId)
-}
-
-func (p *BufferPool) GetForWrite(pageId PageId) (*Page, error) {
-	shard := p.getShard(pageId)
-
-	shard.mu.Lock()
-	if exPage, ok := shard.m[pageId]; ok {
-		exPage.mu.Lock()
-		shard.mu.Unlock()
-
-		if exPage.state != Ready {
-			exPage.mu.Unlock()
-			panic("bufferpool: GetForWrite on non-Ready resident page")
-		}
-
-		clear(exPage.data)
-		exPage.pinCount = 1
-		exPage.refCount = maxRefCount
-		exPage.dirty = true
-		exPage.mu.Unlock()
-		return exPage, nil
-	}
-	shard.mu.Unlock()
-
-	frame, err := p.acquireFrame()
+func (bp *BufferPool) loadAndInstall(pageId PageId) (*Page, error) {
+	frame, err := bp.acquireFrame()
 	if err != nil {
 		return nil, err
 	}
 
-	shard.mu.Lock()
-	clear(frame.data)
+	if err := bp.sm.ReadPage(pageId, frame.data); err != nil {
+		bp.releaseToFree(frame)
+		return nil, err
+	}
+
+	pageTable := bp.getPageTable(pageId)
+	pageTable.mu.Lock()
+	frame.mu.Lock()
 	frame.pageId = pageId
-	frame.state = Ready
-	frame.dirty = true
-	shard.m[pageId] = frame
-	shard.mu.Unlock()
+	frame.pinCount = 1
+	frame.usageCount = maxUsageCount
+	frame.evicting = false
+	pageTable.m[pageId] = frame
 	frame.mu.Unlock()
+	pageTable.mu.Unlock()
+
 	return frame, nil
 }
 
-func (p *BufferPool) acquireFrame() (*Page, error) {
-	p.mu.Lock()
-	start := p.clockHand
-	sawUnpinned := false
-
-	for {
-		p.clockHand = (p.clockHand + 1) % len(p.frames)
-		if p.clockHand == start {
-			if !sawUnpinned {
-				p.mu.Unlock()
-				return nil, ErrBufferExhausted
-			}
-			sawUnpinned = false
-		}
-
-		frame := p.frames[p.clockHand]
-		frame.mu.Lock()
-
-		if frame.pinCount > 0 {
-			frame.mu.Unlock()
-			continue
-		}
-		sawUnpinned = true
-
-		if frame.state == Empty {
-			frame.pinCount = 1
-			frame.refCount = maxRefCount
-			p.mu.Unlock()
-			return frame, nil
-		}
-
-		if frame.state != Ready {
-			frame.mu.Unlock()
-			continue
-		}
-
-		if frame.refCount > 0 {
-			frame.refCount--
-			frame.mu.Unlock()
-			continue
-		}
-
-		oldPageId := frame.pageId
-		wasDirty := frame.dirty
-		data := frame.data
-		frame.state = Evicting
-
-		p.mu.Unlock()
-		frame.mu.Unlock()
-
-		if wasDirty {
-			if err := p.sm.WritePage(oldPageId, data); err != nil {
-				frame.mu.Lock()
-				frame.state = Ready
-				// Wake any Get(oldPageId) waiters parked on state == Evicting.
-				frame.c.Broadcast()
-				frame.mu.Unlock()
-				p.mu.Lock()
-				continue
-			}
-		}
-
-		shard := p.getShard(oldPageId)
-		shard.mu.Lock()
-		delete(shard.m, oldPageId)
-		shard.mu.Unlock()
-
-		frame.mu.Lock()
-
-		frame.pageId = freePageId
-		frame.state = Empty
-		frame.dirty = false
-		frame.pinCount = 1
-		frame.refCount = maxRefCount
-
-		// Wake any Get(oldPageId) waiters parked on state == Evicting.
-		frame.c.Broadcast()
-
-		return frame, nil
-	}
+func (bp *BufferPool) releaseToFree(frame *Page) {
+	frame.mu.Lock()
+	frame.pageId = freePageId
+	frame.pinCount = 0
+	frame.usageCount = 0
+	frame.dirty = false
+	frame.evicting = false
+	frame.mu.Unlock()
 }
 
-func (p *BufferPool) FlushPage(pageId PageId) error {
-	shard := p.getShard(pageId)
-	shard.mu.Lock()
-	frame, ok := shard.m[pageId]
+func (bp *BufferPool) GetForWrite(pageId PageId) (*Page, error) {
+	pageTable := bp.getPageTable(pageId)
+
+	pageTable.mu.Lock()
+	if frame, exists := pageTable.m[pageId]; exists {
+		frame.mu.Lock()
+		pageTable.mu.Unlock()
+
+		if frame.evicting || frame.pinCount > 0 {
+			frame.mu.Unlock()
+			return nil, ErrInvalidWrite
+		}
+		frame.pinCount = 1
+		frame.usageCount = maxUsageCount
+		frame.dirty = true
+		frame.mu.Unlock()
+		return frame, nil
+	}
+	pageTable.mu.Unlock()
+
+	frame, err := bp.acquireFrame()
+	if err != nil {
+		return nil, err
+	}
+
+	pageTable.mu.Lock()
+	frame.mu.Lock()
+	frame.pageId = pageId
+	frame.pinCount = 1
+	frame.usageCount = maxUsageCount
+	frame.dirty = true
+	frame.evicting = false
+	pageTable.m[pageId] = frame
+	frame.mu.Unlock()
+	pageTable.mu.Unlock()
+
+	return frame, nil
+}
+
+func (bp *BufferPool) AllocatePage(pageId PageId) (*Page, error) {
+	if err := bp.sm.Allocate(pageId); err != nil {
+		return nil, err
+	}
+	return bp.GetForWrite(pageId)
+}
+
+func (bp *BufferPool) FlushPage(pageId PageId) error {
+	pageTable := bp.getPageTable(pageId)
+	pageTable.mu.Lock()
+	frame, ok := pageTable.m[pageId]
+	pageTable.mu.Unlock()
 	if !ok {
-		shard.mu.Unlock()
 		return nil
 	}
-	frame.mu.Lock()
-	shard.mu.Unlock()
 
-	if frame.state != Ready || !frame.dirty {
+	frame.mu.Lock()
+	if frame.evicting || !frame.dirty {
 		frame.mu.Unlock()
 		return nil
 	}
-
-	data := frame.data
 	frame.mu.Unlock()
 
-	if err := p.sm.WritePage(pageId, data); err != nil {
+	if err := bp.sm.WritePage(pageId, frame.data); err != nil {
 		return err
 	}
 
 	frame.mu.Lock()
-	frame.dirty = false
+	if !frame.evicting {
+		frame.dirty = false
+	}
 	frame.mu.Unlock()
 	return nil
 }
 
-type dirtyFrame struct {
-	pageId PageId
-	data   []byte
-	frame  *Page
-}
-
-func (p *BufferPool) FlushPages(ids []PageId) error {
-	dirty := make([]dirtyFrame, 0, len(ids))
-	for _, pageId := range ids {
-		shard := p.getShard(pageId)
-		shard.mu.Lock()
-		frame, ok := shard.m[pageId]
+func (bp *BufferPool) FlushPages(pageIds []PageId) error {
+	dirty := make([]*Page, 0, len(pageIds))
+	for _, pageId := range pageIds {
+		pageTable := bp.getPageTable(pageId)
+		pageTable.mu.Lock()
+		frame, ok := pageTable.m[pageId]
+		pageTable.mu.Unlock()
 		if !ok {
-			shard.mu.Unlock()
 			continue
 		}
-		frame.mu.Lock()
-		shard.mu.Unlock()
 
-		if frame.state != Ready || !frame.dirty {
+		frame.mu.Lock()
+		if frame.evicting || !frame.dirty {
 			frame.mu.Unlock()
 			continue
 		}
-		dirty = append(dirty, dirtyFrame{
-			pageId: pageId,
-			data:   frame.data,
-			frame:  frame,
-		})
 		frame.mu.Unlock()
+		dirty = append(dirty, frame)
 	}
-	return p.flushDirty(dirty)
+	return bp.flushDirty(dirty)
 }
 
-func (p *BufferPool) FlushAll() error {
-	dirty := make([]dirtyFrame, 0, len(p.frames))
-	for _, frame := range p.frames {
+func (bp *BufferPool) FlushAll() error {
+	dirty := make([]*Page, 0, len(bp.frames))
+	for i := range bp.frames {
+		frame := &bp.frames[i]
+
 		frame.mu.Lock()
-		if frame.state != Ready || !frame.dirty {
+		if frame.evicting || !frame.dirty {
 			frame.mu.Unlock()
 			continue
 		}
-		dirty = append(dirty, dirtyFrame{
-			pageId: frame.pageId,
-			data:   frame.data,
-			frame:  frame,
-		})
 		frame.mu.Unlock()
+		dirty = append(dirty, frame)
 	}
-	return p.flushDirty(dirty)
+	return bp.flushDirty(dirty)
 }
 
-func (p *BufferPool) flushDirty(dirty []dirtyFrame) error {
-	sort.Slice(dirty, func(i, j int) bool {
-		return dirty[i].pageId < dirty[j].pageId
+func (bp *BufferPool) MarkClean(pageId PageId) {
+	pageTable := bp.getPageTable(pageId)
+	pageTable.mu.Lock()
+	frame, ok := pageTable.m[pageId]
+	if !ok {
+		pageTable.mu.Unlock()
+		return
+	}
+
+	frame.mu.Lock()
+	pageTable.mu.Unlock()
+	frame.dirty = false
+	frame.mu.Unlock()
+}
+
+func (bp *BufferPool) Sync() error {
+	return bp.sm.Sync()
+}
+
+func (bp *BufferPool) Close() error {
+	flushErr := bp.FlushAll()
+	syncErr := bp.sm.Sync()
+	closeErr := bp.sm.Close()
+	return errors.Join(flushErr, syncErr, closeErr)
+}
+
+func (bp *BufferPool) flushDirty(dirty []*Page) error {
+	if len(dirty) == 0 {
+		return nil
+	}
+
+	slices.SortFunc(dirty, func(a, b *Page) int {
+		return cmp.Compare(a.pageId, b.pageId)
 	})
+
+	g, ctx := errgroup.WithContext(context.Background())
+	g.SetLimit(maxFlushConcurrency)
 
 	for i := 0; i < len(dirty); {
 		j := i + 1
 		for j < len(dirty) && dirty[j].pageId == dirty[j-1].pageId+1 {
 			j++
 		}
-		bufs := make([][]byte, 0, j-i)
-		for k := i; k < j; k++ {
-			bufs = append(bufs, dirty[k].data)
-		}
-		if err := p.sm.WritePagesContiguous(dirty[i].pageId, bufs); err != nil {
-			return err
-		}
-		for k := i; k < j; k++ {
-			dirty[k].frame.mu.Lock()
-			dirty[k].frame.dirty = false
-			dirty[k].frame.mu.Unlock()
-		}
+		frames := dirty[i:j]
 		i = j
+
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			bufs := make([][]byte, len(frames))
+			for k, f := range frames {
+				bufs[k] = f.data
+			}
+			if err := bp.sm.WritePagesContiguous(frames[0].pageId, bufs); err != nil {
+				return err
+			}
+			for _, f := range frames {
+				f.mu.Lock()
+				if !f.evicting {
+					f.dirty = false
+				}
+				f.mu.Unlock()
+			}
+			return nil
+		})
 	}
-	return nil
+
+	return g.Wait()
 }
 
-func (p *BufferPool) MarkClean(pageID PageId) {
-	shard := p.getShard(pageID)
-	shard.mu.Lock()
-	frame, ok := shard.m[pageID]
-	if !ok {
-		shard.mu.Unlock()
-		return
+func (bp *BufferPool) acquireFrame() (*Page, error) {
+	for {
+		victim, err := bp.evictFrame()
+		if err != nil {
+			return nil, err
+		}
+
+		victim.mu.Lock()
+		if victim.pageId == freePageId {
+			victim.mu.Unlock()
+			return victim, nil
+		}
+
+		oldPageId := victim.pageId
+		dirty := victim.dirty
+		victim.mu.Unlock()
+
+		if dirty {
+			if err := bp.sm.WritePage(oldPageId, victim.data); err != nil {
+				victim.mu.Lock()
+				victim.evicting = false
+				victim.mu.Unlock()
+				return nil, err
+			}
+		}
+
+		pageTable := bp.getPageTable(oldPageId)
+		pageTable.mu.Lock()
+		victim.mu.Lock()
+		if victim.pinCount > 0 {
+			victim.dirty = false
+			victim.evicting = false
+			victim.mu.Unlock()
+			pageTable.mu.Unlock()
+			continue
+		}
+		delete(pageTable.m, oldPageId)
+		victim.pageId = freePageId
+		victim.dirty = false
+		victim.mu.Unlock()
+		pageTable.mu.Unlock()
+
+		return victim, nil
 	}
-	frame.mu.Lock()
-	shard.mu.Unlock()
-	frame.dirty = false
-	frame.mu.Unlock()
 }
 
-func (pg *Page) Unpin() {
-	pg.mu.Lock()
-	if pg.pinCount <= 0 {
-		pg.mu.Unlock()
-		panic("bufferpool: Unpin on page with pinCount <= 0")
-	}
-	pg.pinCount--
-	pg.mu.Unlock()
-}
+func (bp *BufferPool) evictFrame() (*Page, error) {
+	nFrames := len(bp.frames)
+	tries := nFrames
 
-func (p *BufferPool) Sync() error {
-	return p.sm.Sync()
-}
+	for {
+		frame := &bp.frames[(bp.clockHand.Add(1)-1)%uint32(len(bp.frames))]
+		frame.mu.Lock()
 
-func (p *BufferPool) Close() error {
-	flushErr := p.FlushAll()
-	closeErr := p.sm.Close()
-	if flushErr != nil {
-		return flushErr
+		if frame.evicting {
+			frame.mu.Unlock()
+			continue
+		}
+
+		if frame.pageId == freePageId {
+			frame.evicting = true
+			frame.mu.Unlock()
+			return frame, nil
+		}
+
+		if frame.pinCount == 0 {
+			if frame.usageCount != 0 {
+				frame.usageCount--
+				tries = nFrames
+				frame.mu.Unlock()
+				continue
+			} else {
+				frame.evicting = true
+				frame.mu.Unlock()
+				return frame, nil
+			}
+		}
+
+		tries--
+		if tries == 0 {
+			frame.mu.Unlock()
+			return nil, ErrBufferExhausted
+		}
+		frame.mu.Unlock()
 	}
-	return closeErr
 }

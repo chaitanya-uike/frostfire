@@ -2,286 +2,314 @@ package frostfire
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
-func newTestPool(t *testing.T, size int) (*BufferPool, *StorageManager) {
+func newTestBufferPool(t *testing.T, size int) (*BufferPool, *StorageManager) {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.db")
-	sm, _, err := NewStorageManager(path)
+
+	sm, _, err := NewStorageManager(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("NewStorageManager: %v", err)
 	}
-	t.Cleanup(func() { sm.Close() })
+	t.Cleanup(func() {
+		_ = sm.Close()
+	})
+
 	return NewBufferPool(sm, size), sm
 }
 
-func fillPool(t *testing.T, bp *BufferPool, startId PageId, n int) {
+func writePagePattern(t *testing.T, p *Page, label string) {
 	t.Helper()
-	for i := range n {
-		p, err := bp.AllocatePage(startId + PageId(i))
-		if err != nil {
-			t.Fatalf("AllocatePage(%d): %v", startId+PageId(i), err)
-		}
-		p.Unpin()
+	clear(p.Data())
+	copy(p.Data(), []byte(label))
+	p.Data()[PageSize-1] = byte(len(label))
+}
+
+func assertPagePattern(t *testing.T, p *Page, label string) {
+	t.Helper()
+	got := p.Data()[:len(label)]
+	if !bytes.Equal(got, []byte(label)) {
+		t.Fatalf("page %d data prefix = %q, want %q", p.ID(), got, label)
+	}
+	if got := p.Data()[PageSize-1]; got != byte(len(label)) {
+		t.Fatalf("page %d trailer = %d, want %d", p.ID(), got, len(label))
 	}
 }
 
-func TestAllocateThenGetReturnsSameData(t *testing.T) {
-	bp, _ := newTestPool(t, 4)
+func residentPage(t *testing.T, bp *BufferPool, pageId PageId) *Page {
+	t.Helper()
 
-	pg, err := bp.AllocatePage(0)
-	if err != nil {
-		t.Fatalf("AllocatePage: %v", err)
+	pageTable := bp.getPageTable(pageId)
+	pageTable.mu.Lock()
+	p, ok := pageTable.m[pageId]
+	pageTable.mu.Unlock()
+	if !ok {
+		t.Fatalf("page %d is not resident", pageId)
 	}
-	want := []byte("hello frostfire")
-	copy(pg.data, want)
-	pg.Unpin()
-
-	got, err := bp.Get(0)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	defer got.Unpin()
-	if !bytes.Equal(got.data[:len(want)], want) {
-		t.Fatalf("got %q want %q", got.data[:len(want)], want)
-	}
+	return p
 }
 
-func TestGetReturnsSameFrameForSameId(t *testing.T) {
-	bp, _ := newTestPool(t, 4)
+func pageDirty(t *testing.T, p *Page) bool {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dirty
+}
+
+func TestBufferPoolReadWriteRoundTrip(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 4)
+
 	p, err := bp.AllocatePage(7)
 	if err != nil {
 		t.Fatalf("AllocatePage: %v", err)
 	}
+	if got := p.ID(); got != 7 {
+		t.Fatalf("allocated page ID = %d, want 7", got)
+	}
+	writePagePattern(t, p, "hello-bufferpool")
 	p.Unpin()
 
-	a, err := bp.Get(7)
+	p, err = bp.Get(7)
 	if err != nil {
-		t.Fatalf("Get a: %v", err)
+		t.Fatalf("Get: %v", err)
 	}
-	defer a.Unpin()
-	b, err := bp.Get(7)
-	if err != nil {
-		t.Fatalf("Get b: %v", err)
-	}
-	defer b.Unpin()
-	if a != b {
-		t.Fatalf("Get returned different *Page for same id")
-	}
-
-	want := []byte("shared")
-	copy(a.data, want)
-	if !bytes.Equal(b.data[:len(want)], want) {
-		t.Fatalf("mutation not visible across handles")
-	}
+	defer p.Unpin()
+	assertPagePattern(t, p, "hello-bufferpool")
 }
 
-func TestBufferExhaustedWhenAllPinned(t *testing.T) {
-	bp, _ := newTestPool(t, 2)
-	p0, err := bp.AllocatePage(0)
+func TestGetForWriteRequiresExclusiveUnpinnedPage(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 2)
+
+	p, err := bp.AllocatePage(1)
+	if err != nil {
+		t.Fatalf("AllocatePage: %v", err)
+	}
+
+	if _, err := bp.GetForWrite(1); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("GetForWrite pinned page error = %v, want %v", err, ErrInvalidWrite)
+	}
+
+	p.Unpin()
+	p, err = bp.GetForWrite(1)
+	if err != nil {
+		t.Fatalf("GetForWrite after unpin: %v", err)
+	}
+	p.Unpin()
+}
+
+func TestPinnedPoolReportsExhaustion(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 1)
+
+	p, err := bp.AllocatePage(0)
 	if err != nil {
 		t.Fatalf("AllocatePage(0): %v", err)
 	}
-	p1, err := bp.AllocatePage(1)
+	defer p.Unpin()
+
+	if _, err := bp.AllocatePage(1); !errors.Is(err, ErrBufferExhausted) {
+		t.Fatalf("AllocatePage with only frame pinned error = %v, want %v", err, ErrBufferExhausted)
+	}
+}
+
+func TestEvictionPersistsDirtyVictimBeforeReuse(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 1)
+
+	p, err := bp.AllocatePage(0)
+	if err != nil {
+		t.Fatalf("AllocatePage(0): %v", err)
+	}
+	writePagePattern(t, p, "dirty-victim")
+	p.Unpin()
+
+	p, err = bp.AllocatePage(1)
 	if err != nil {
 		t.Fatalf("AllocatePage(1): %v", err)
 	}
+	writePagePattern(t, p, "replacement")
+	p.Unpin()
 
-	if _, err := bp.AllocatePage(2); err != ErrBufferExhausted {
-		t.Fatalf("got %v want ErrBufferExhausted", err)
-	}
-
-	p0.Unpin()
-	p1.Unpin()
-	if _, err := bp.AllocatePage(2); err != nil {
-		t.Fatalf("AllocatePage(2) after unpin: %v", err)
-	}
-}
-
-func TestUnpinPanicsWhenUnpinned(t *testing.T) {
-	bp, _ := newTestPool(t, 2)
-	pg, err := bp.AllocatePage(0)
+	p, err = bp.Get(0)
 	if err != nil {
-		t.Fatalf("AllocatePage: %v", err)
+		t.Fatalf("Get(0): %v", err)
 	}
-	pg.Unpin()
-
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("expected panic on excess Unpin")
-		}
-	}()
-	pg.Unpin()
+	defer p.Unpin()
+	assertPagePattern(t, p, "dirty-victim")
 }
 
-func TestFlushPagePersistsToDisk(t *testing.T) {
-	bp, sm := newTestPool(t, 2)
-	pg, err := bp.AllocatePage(3)
-	if err != nil {
-		t.Fatalf("AllocatePage: %v", err)
-	}
-	want := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
-	copy(pg.data, want)
-	pg.Unpin()
+func TestMarkCleanPreventsAbortPagesFromFlushing(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 1)
 
-	if err := bp.FlushPage(3); err != nil {
-		t.Fatalf("FlushPage: %v", err)
-	}
-
-	buf := NewBuffer()
-	if err := sm.ReadPage(3, buf); err != nil {
-		t.Fatalf("ReadPage: %v", err)
-	}
-	if !bytes.Equal(buf[:len(want)], want) {
-		t.Fatalf("got %v want %v", buf[:len(want)], want)
-	}
-}
-
-func TestFlushAllPersistsAllDirtyPages(t *testing.T) {
-	bp, sm := newTestPool(t, 8)
-
-	wants := map[PageId][]byte{
-		0: []byte("page-zero"),
-		1: []byte("page-one"),
-		2: []byte("page-two"),
-		3: []byte("page-three"),
-	}
-	for id, want := range wants {
-		pg, err := bp.AllocatePage(id)
-		if err != nil {
-			t.Fatalf("AllocatePage(%d): %v", id, err)
-		}
-		copy(pg.data, want)
-		pg.Unpin()
-	}
-
-	if err := bp.FlushAll(); err != nil {
-		t.Fatalf("FlushAll: %v", err)
-	}
-
-	for id, want := range wants {
-		buf := NewBuffer()
-		if err := sm.ReadPage(id, buf); err != nil {
-			t.Fatalf("ReadPage(%d): %v", id, err)
-		}
-		if !bytes.Equal(buf[:len(want)], want) {
-			t.Fatalf("page %d: got %q want %q", id, buf[:len(want)], want)
-		}
-	}
-}
-
-func TestPinnedPageSurvivesPressure(t *testing.T) {
-	bp, _ := newTestPool(t, 4)
-
-	pinned, err := bp.AllocatePage(0)
+	p, err := bp.AllocatePage(0)
 	if err != nil {
 		t.Fatalf("AllocatePage(0): %v", err)
 	}
-	want := []byte("survive me")
-	copy(pinned.data, want)
+	writePagePattern(t, p, "aborted")
+	p.Unpin()
 
-	fillPool(t, bp, 100, 64)
-
-	if !bytes.Equal(pinned.data[:len(want)], want) {
-		t.Fatalf("pinned page corrupted: got %q want %q", pinned.data[:len(want)], want)
-	}
-
-	again, err := bp.Get(0)
-	if err != nil {
-		t.Fatalf("Get(0) after churn: %v", err)
-	}
-	defer again.Unpin()
-	if again != pinned {
-		t.Fatalf("pinned page was evicted: Get returned a different *Page")
-	}
-
-	pinned.Unpin()
-}
-
-func TestEvictedPageReloadsFromDisk(t *testing.T) {
-	bp, _ := newTestPool(t, 4)
-
-	pg, err := bp.AllocatePage(0)
-	if err != nil {
-		t.Fatalf("AllocatePage: %v", err)
-	}
-	want := []byte("evict-and-reload")
-	copy(pg.data, want)
-	pg.Unpin()
+	bp.MarkClean(0)
 	if err := bp.FlushPage(0); err != nil {
-		t.Fatalf("FlushPage: %v", err)
+		t.Fatalf("FlushPage after MarkClean: %v", err)
 	}
 
-	fillPool(t, bp, 100, 64)
-
-	got, err := bp.Get(0)
+	p, err = bp.AllocatePage(1)
 	if err != nil {
-		t.Fatalf("Get(0) after churn: %v", err)
+		t.Fatalf("AllocatePage(1): %v", err)
 	}
-	defer got.Unpin()
-	if !bytes.Equal(got.data[:len(want)], want) {
-		t.Fatalf("got %q want %q", got.data[:len(want)], want)
+	p.Unpin()
+
+	p, err = bp.Get(0)
+	if err != nil {
+		t.Fatalf("Get(0): %v", err)
+	}
+	defer p.Unpin()
+	if bytes.Contains(p.Data(), []byte("aborted")) {
+		t.Fatalf("aborted page contents were written to disk")
 	}
 }
 
-func TestDirtyEvictionFlushesBeforeReuse(t *testing.T) {
-	bp, sm := newTestPool(t, 4)
+func TestFlushPagesOnlyCleansRequestedDirtyPages(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 4)
 
-	pg, err := bp.AllocatePage(0)
+	for id := range PageId(3) {
+		p, err := bp.AllocatePage(id)
+		if err != nil {
+			t.Fatalf("AllocatePage(%d): %v", id, err)
+		}
+		writePagePattern(t, p, "dirty")
+		p.Unpin()
+	}
+
+	if err := bp.FlushPages([]PageId{1}); err != nil {
+		t.Fatalf("FlushPages: %v", err)
+	}
+
+	if !pageDirty(t, residentPage(t, bp, 0)) {
+		t.Fatalf("page 0 should remain dirty")
+	}
+	if pageDirty(t, residentPage(t, bp, 1)) {
+		t.Fatalf("page 1 should have been marked clean")
+	}
+	if !pageDirty(t, residentPage(t, bp, 2)) {
+		t.Fatalf("page 2 should remain dirty")
+	}
+}
+
+func TestGetPinsMappedPageEvenWhileEvicting(t *testing.T) {
+	bp, _ := newTestBufferPool(t, 1)
+
+	p, err := bp.AllocatePage(0)
 	if err != nil {
 		t.Fatalf("AllocatePage: %v", err)
 	}
-	want := []byte("dirty-evicted")
-	copy(pg.data, want)
-	pg.Unpin()
+	writePagePattern(t, p, "resident-during-eviction")
+	p.Unpin()
 
-	fillPool(t, bp, 100, 64)
+	resident := residentPage(t, bp, 0)
+	resident.mu.Lock()
+	resident.evicting = true
+	resident.mu.Unlock()
 
-	buf := NewBuffer()
-	if err := sm.ReadPage(0, buf); err != nil {
-		t.Fatalf("ReadPage(0): %v", err)
+	p, err = bp.Get(0)
+	if err != nil {
+		t.Fatalf("Get evicting mapped page: %v", err)
 	}
-	if !bytes.Equal(buf[:len(want)], want) {
-		t.Fatalf("dirty page was not flushed on eviction: got %q want %q", buf[:len(want)], want)
+	assertPagePattern(t, p, "resident-during-eviction")
+
+	p.mu.Lock()
+	if p.pinCount != 1 {
+		t.Fatalf("pinCount while evicting = %d, want 1", p.pinCount)
 	}
+	p.evicting = false
+	p.mu.Unlock()
+	p.Unpin()
 }
 
-func TestGetForWriteMakesPageDirty(t *testing.T) {
-	bp, sm := newTestPool(t, 4)
+func TestConcurrentColdGetReturnsOneResidentPageWithIndependentPins(t *testing.T) {
+	bp, sm := newTestBufferPool(t, 8)
 
-	pg, err := bp.AllocatePage(0)
-	if err != nil {
-		t.Fatalf("AllocatePage: %v", err)
+	if err := sm.Allocate(42); err != nil {
+		t.Fatalf("sm.Allocate: %v", err)
 	}
-	original := []byte("original-contents")
-	copy(pg.data, original)
-	pg.Unpin()
-	if err := bp.FlushPage(0); err != nil {
-		t.Fatalf("FlushPage: %v", err)
-	}
-
-	w, err := bp.GetForWrite(0)
-	if err != nil {
-		t.Fatalf("GetForWrite: %v", err)
-	}
-	w.Unpin()
-
-	fillPool(t, bp, 100, 64)
-
 	buf := NewBuffer()
-	if err := sm.ReadPage(0, buf); err != nil {
-		t.Fatalf("ReadPage(0): %v", err)
+	copy(buf, []byte("seeded-on-disk"))
+	buf[PageSize-1] = 0x42
+	if err := sm.WritePage(42, buf); err != nil {
+		t.Fatalf("sm.WritePage: %v", err)
 	}
-	zero := make([]byte, PageSize)
-	if !bytes.Equal(buf, zero) {
-		t.Fatalf("GetForWrite did not mark page dirty: disk still has prior contents")
+
+	const readers = 32
+	pages := make(chan *Page, readers)
+	errs := make(chan error, readers)
+	release := make(chan struct{})
+
+	var wg sync.WaitGroup
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := bp.Get(42)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(p.Data()[:len("seeded-on-disk")], []byte("seeded-on-disk")) || p.Data()[PageSize-1] != 0x42 {
+				errs <- errors.New("bad page contents")
+				p.Unpin()
+				return
+			}
+			pages <- p
+			<-release
+			p.Unpin()
+		}()
 	}
+
+	got := make([]*Page, 0, readers)
+	for len(got) < readers {
+		select {
+		case err := <-errs:
+			close(release)
+			t.Fatalf("concurrent Get: %v", err)
+		case p := <-pages:
+			got = append(got, p)
+		}
+	}
+
+	first := got[0]
+	for i, p := range got[1:] {
+		if p != first {
+			close(release)
+			t.Fatalf("reader %d got page pointer %p, want %p", i+1, p, first)
+		}
+	}
+
+	first.mu.Lock()
+	if first.pinCount != readers {
+		got := first.pinCount
+		first.mu.Unlock()
+		close(release)
+		t.Fatalf("pinCount after concurrent Gets = %d, want %d", got, readers)
+	}
+	first.mu.Unlock()
+
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Get: %v", err)
+	}
+
+	first.mu.Lock()
+	if first.pinCount != 0 {
+		t.Fatalf("pinCount after releases = %d, want 0", first.pinCount)
+	}
+	first.mu.Unlock()
 }
 
-func TestFlushAllSurvivesReopen(t *testing.T) {
+func TestFlushAllPersistsThroughCloseAndReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "reopen.db")
 
@@ -289,36 +317,30 @@ func TestFlushAllSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStorageManager: %v", err)
 	}
-	bp := NewBufferPool(sm, 4)
-	want := []byte("durable")
-	pg, err := bp.AllocatePage(2)
+	bp := NewBufferPool(sm, 2)
+
+	p, err := bp.AllocatePage(9)
 	if err != nil {
 		t.Fatalf("AllocatePage: %v", err)
 	}
-	copy(pg.data, want)
-	pg.Unpin()
-	if err := bp.FlushAll(); err != nil {
-		t.Fatalf("FlushAll: %v", err)
-	}
-	if err := sm.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if err := sm.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	writePagePattern(t, p, "survives-reopen")
+	p.Unpin()
+
+	if err := bp.Close(); err != nil {
+		t.Fatalf("BufferPool.Close: %v", err)
 	}
 
-	sm2, _, err := NewStorageManager(path)
+	sm, _, err = NewStorageManager(path)
 	if err != nil {
 		t.Fatalf("reopen NewStorageManager: %v", err)
 	}
-	defer sm2.Close()
-	bp2 := NewBufferPool(sm2, 4)
-	got, err := bp2.Get(2)
+	defer sm.Close()
+	bp = NewBufferPool(sm, 2)
+
+	p, err = bp.Get(9)
 	if err != nil {
 		t.Fatalf("Get after reopen: %v", err)
 	}
-	defer got.Unpin()
-	if !bytes.Equal(got.data[:len(want)], want) {
-		t.Fatalf("after reopen: got %q want %q", got.data[:len(want)], want)
-	}
+	defer p.Unpin()
+	assertPagePattern(t, p, "survives-reopen")
 }

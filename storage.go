@@ -58,6 +58,7 @@ func (s *StorageManager) WritePage(pageId PageId, buf []byte) error {
 	return err
 }
 
+// vectored writes are limited to 1024 iovec structs in linux
 const pwritevMaxIOV = 1024
 
 func (s *StorageManager) WritePagesContiguous(startPageID PageId, bufs [][]byte) error {

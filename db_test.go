@@ -170,7 +170,7 @@ func TestCorruptOneMetaStillRecovers(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	// Commit twice so both meta pages have valid content with different txnIDs.
-	for txnID := uint64(1); txnID <= 2; txnID++ {
+	for txnID := TxnID(1); txnID <= 2; txnID++ {
 		m := &Meta{
 			magic:        metaMagic,
 			version:      metaVersion,

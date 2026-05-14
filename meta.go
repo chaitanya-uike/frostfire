@@ -27,7 +27,7 @@ type Meta struct {
 	magic        uint32
 	version      uint32
 	pageSize     uint32
-	txnID        uint64
+	txnID        TxnID
 	catalogRoot  PageId
 	freelistRoot PageId
 	numPages     uint64
@@ -42,7 +42,7 @@ func (m *Meta) encode(buf []byte) error {
 	binary.LittleEndian.PutUint32(buf[4:8], m.version)
 	binary.LittleEndian.PutUint32(buf[8:12], m.pageSize)
 	binary.LittleEndian.PutUint32(buf[12:16], 0) // pad
-	binary.LittleEndian.PutUint64(buf[16:24], m.txnID)
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(m.txnID))
 	binary.LittleEndian.PutUint64(buf[24:32], uint64(m.catalogRoot))
 	binary.LittleEndian.PutUint64(buf[32:40], uint64(m.freelistRoot))
 	binary.LittleEndian.PutUint64(buf[40:48], m.numPages)
@@ -64,7 +64,7 @@ func decodeMeta(buf []byte) (*Meta, error) {
 		magic:        binary.LittleEndian.Uint32(buf[0:4]),
 		version:      binary.LittleEndian.Uint32(buf[4:8]),
 		pageSize:     binary.LittleEndian.Uint32(buf[8:12]),
-		txnID:        binary.LittleEndian.Uint64(buf[16:24]),
+		txnID:        TxnID(binary.LittleEndian.Uint64(buf[16:24])),
 		catalogRoot:  PageId(binary.LittleEndian.Uint64(buf[24:32])),
 		freelistRoot: PageId(binary.LittleEndian.Uint64(buf[32:40])),
 		numPages:     binary.LittleEndian.Uint64(buf[40:48]),
@@ -82,7 +82,7 @@ func decodeMeta(buf []byte) (*Meta, error) {
 	return m, nil
 }
 
-func isNewer(a, b uint64) bool {
+func isNewer(a, b TxnID) bool {
 	// should be safe in case of overflow
 	return int64(a-b) > 0
 }

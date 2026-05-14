@@ -7,6 +7,8 @@ var (
 	ErrTxnClosed   = errors.New("frostfire: transaction already closed")
 )
 
+type TxnID uint64
+
 type Txn struct {
 	db       *DB
 	writable bool

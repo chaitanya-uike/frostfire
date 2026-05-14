@@ -22,7 +22,7 @@ type DB struct {
 	freelist *freelist
 
 	readersMu sync.Mutex
-	readers   map[uint64]int
+	readers   map[TxnID]int
 }
 
 func Open(path string, opts Options) (*DB, error) {
@@ -37,7 +37,7 @@ func Open(path string, opts Options) (*DB, error) {
 	db := &DB{
 		bufferPool: NewBufferPool(smgr, bufSize),
 		freelist:   newFreelist(),
-		readers:    make(map[uint64]int),
+		readers:    make(map[TxnID]int),
 	}
 	if isNew {
 		if err := db.initMetas(); err != nil {
@@ -70,7 +70,7 @@ func (db *DB) Close() error {
 	return db.bufferPool.Close()
 }
 
-func (db *DB) unregisterReader(txnID uint64) {
+func (db *DB) unregisterReader(txnID TxnID) {
 	db.readersMu.Lock()
 	if db.readers[txnID]--; db.readers[txnID] <= 0 {
 		delete(db.readers, txnID)
@@ -78,7 +78,7 @@ func (db *DB) unregisterReader(txnID uint64) {
 	db.readersMu.Unlock()
 }
 
-func (db *DB) minReaderTxn() uint64 {
+func (db *DB) minReaderTxn() TxnID {
 	current := db.currentMeta.Load().txnID
 	db.readersMu.Lock()
 	defer db.readersMu.Unlock()

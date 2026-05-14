@@ -2,7 +2,7 @@ package frostfire
 
 type freelistEntry struct {
 	pageID  PageId
-	freedAt uint64
+	freedAt TxnID
 }
 
 type freelist struct {
@@ -13,13 +13,13 @@ func newFreelist() *freelist {
 	return &freelist{}
 }
 
-func (f *freelist) pushMany(ids []PageId, freedAt uint64) {
+func (f *freelist) pushMany(ids []PageId, freedAt TxnID) {
 	for _, id := range ids {
 		f.pending = append(f.pending, freelistEntry{pageID: id, freedAt: freedAt})
 	}
 }
 
-func (f *freelist) popReusable(minReaderTxn uint64) (PageId, bool) {
+func (f *freelist) popReusable(minReaderTxn TxnID) (PageId, bool) {
 	if len(f.pending) == 0 || f.pending[0].freedAt > minReaderTxn {
 		return 0, false
 	}

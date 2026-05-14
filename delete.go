@@ -46,25 +46,33 @@ func (t *BTree) Delete(key []byte) (PageId, bool, error) {
 
 func (t *BTree) delete(node *bnode, key []byte) (*bnode, bool, error) {
 	if node.ntype() == nodeLeaf {
-		deleteIdx, exists := searchLeaf(node, key)
-		if !exists {
-			return nil, false, nil
-		}
+		return t.deleteFromLeaf(node, key)
+	}
+	return t.deleteFromInternal(node, key)
+}
 
-		if oldOv := node.leafCellOverflowId(deleteIdx); oldOv != 0 {
-			if err := t.freeOverflowPages(oldOv); err != nil {
-				return nil, false, err
-			}
-		}
-
-		newNode, err := t.allocLeaf()
-		if err != nil {
-			return nil, false, err
-		}
-		newNode.copyWithoutCell(node, deleteIdx)
-		return newNode, true, nil
+func (t *BTree) deleteFromLeaf(node *bnode, key []byte) (*bnode, bool, error) {
+	deleteIdx, exists := searchLeaf(node, key)
+	if !exists {
+		return nil, false, nil
 	}
 
+	// Deleting an overflow value must release the old overflow chain.
+	if oldOv := node.leafCellOverflowId(deleteIdx); oldOv != 0 {
+		if err := t.freeOverflowPages(oldOv); err != nil {
+			return nil, false, err
+		}
+	}
+
+	newNode, err := t.allocLeaf()
+	if err != nil {
+		return nil, false, err
+	}
+	newNode.copyWithoutCell(node, deleteIdx)
+	return newNode, true, nil
+}
+
+func (t *BTree) deleteFromInternal(node *bnode, key []byte) (*bnode, bool, error) {
 	childIdx := searchInternal(node, key)
 	childPageID := node.child(childIdx)
 	childNode, err := t.get(childPageID)
@@ -84,17 +92,28 @@ func (t *BTree) delete(node *bnode, key []byte) (*bnode, bool, error) {
 	t.txn.FreePage(childPageID)
 
 	if !newChild.underfull() {
-		dst, err := t.allocInternal()
-		if err != nil {
-			newChild.Unpin()
-			return nil, false, err
-		}
-		copy(dst.data(), node.data())
-		dst.setChild(childIdx, newChild.Id())
-		newChild.Unpin()
-		return dst, true, nil
+		return t.replaceChildAfterDelete(node, childIdx, newChild)
 	}
 
+	if dst, ok, err := t.borrowForUnderfullChild(node, childIdx, newChild); ok || err != nil {
+		return dst, ok, err
+	}
+	return t.mergeUnderfullChild(node, childIdx, newChild)
+}
+
+func (t *BTree) replaceChildAfterDelete(node *bnode, childIdx uint16, newChild *bnode) (*bnode, bool, error) {
+	dst, err := t.allocInternal()
+	if err != nil {
+		newChild.Unpin()
+		return nil, false, err
+	}
+	copy(dst.data(), node.data())
+	dst.setChild(childIdx, newChild.Id())
+	newChild.Unpin()
+	return dst, true, nil
+}
+
+func (t *BTree) borrowForUnderfullChild(node *bnode, childIdx uint16, newChild *bnode) (*bnode, bool, error) {
 	if childIdx > 0 {
 		leftPageID := node.child(childIdx - 1)
 		leftSibling, err := t.get(leftPageID)
@@ -103,20 +122,15 @@ func (t *BTree) delete(node *bnode, key []byte) (*bnode, bool, error) {
 			return nil, false, err
 		}
 		if siblingCanDonate(leftSibling) {
-			var newLeft *bnode
-			var newSepKey []byte
-			if newChild.ntype() == nodeLeaf {
-				newLeft, newSepKey, err = t.borrowFromLeftLeaf(leftSibling, newChild)
-			} else {
-				newLeft, newSepKey, err = t.borrowFromLeftInternal(leftSibling, node.key(childIdx-1), newChild)
-			}
+			newLeft, sepKey, err := t.borrowFromLeft(node, childIdx, leftSibling, newChild)
 			leftSibling.Unpin()
 			if err != nil {
 				newChild.Unpin()
 				return nil, false, err
 			}
+
 			t.txn.FreePage(leftPageID)
-			dst, err := t.rebuildParentForBorrow(node, childIdx-1, newLeft.Id(), newSepKey, newChild.Id())
+			dst, err := t.rebuildParentForBorrow(node, childIdx-1, newLeft.Id(), sepKey, newChild.Id())
 			newLeft.Unpin()
 			newChild.Unpin()
 			if err != nil {
@@ -135,20 +149,15 @@ func (t *BTree) delete(node *bnode, key []byte) (*bnode, bool, error) {
 			return nil, false, err
 		}
 		if siblingCanDonate(rightSibling) {
-			var newRight *bnode
-			var newSepKey []byte
-			if newChild.ntype() == nodeLeaf {
-				newRight, newSepKey, err = t.borrowFromRightLeaf(rightSibling, newChild)
-			} else {
-				newRight, newSepKey, err = t.borrowFromRightInternal(rightSibling, node.key(childIdx), newChild)
-			}
+			newRight, sepKey, err := t.borrowFromRight(node, childIdx, rightSibling, newChild)
 			rightSibling.Unpin()
 			if err != nil {
 				newChild.Unpin()
 				return nil, false, err
 			}
+
 			t.txn.FreePage(rightPageID)
-			dst, err := t.rebuildParentForBorrow(node, childIdx, newChild.Id(), newSepKey, newRight.Id())
+			dst, err := t.rebuildParentForBorrow(node, childIdx, newChild.Id(), sepKey, newRight.Id())
 			newRight.Unpin()
 			newChild.Unpin()
 			if err != nil {
@@ -159,59 +168,89 @@ func (t *BTree) delete(node *bnode, key []byte) (*bnode, bool, error) {
 		rightSibling.Unpin()
 	}
 
-	// Neither sibling can donate, so merge with one neighbor and remove the
-	// separator that used to sit between them.
+	return nil, false, nil
+}
+
+func (t *BTree) borrowFromLeft(node *bnode, childIdx uint16, leftSibling, child *bnode) (*bnode, []byte, error) {
+	if child.ntype() == nodeLeaf {
+		return t.borrowFromLeftLeaf(leftSibling, child)
+	}
+	return t.borrowFromLeftInternal(leftSibling, node.key(childIdx-1), child)
+}
+
+func (t *BTree) borrowFromRight(node *bnode, childIdx uint16, rightSibling, child *bnode) (*bnode, []byte, error) {
+	if child.ntype() == nodeLeaf {
+		return t.borrowFromRightLeaf(rightSibling, child)
+	}
+	return t.borrowFromRightInternal(rightSibling, node.key(childIdx), child)
+}
+
+func (t *BTree) mergeUnderfullChild(node *bnode, childIdx uint16, newChild *bnode) (*bnode, bool, error) {
+	// Neither sibling can donate, so combine the child with one sibling and
+	// remove their separator from the parent.
 	if childIdx > 0 {
-		leftPageID := node.child(childIdx - 1)
-		leftSibling, err := t.get(leftPageID)
-		if err != nil {
-			newChild.Unpin()
-			return nil, false, err
-		}
-		merged, err := t.mergeWithLeft(leftSibling, node.key(childIdx-1), newChild)
-		leftSibling.Unpin()
-		if err != nil {
-			newChild.Unpin()
-			return nil, false, err
-		}
-		t.txn.FreePage(leftPageID)
-		newChildID := newChild.Id()
-		newChild.Unpin()
-		t.txn.FreePage(newChildID)
-		dst, err := t.rebuildParentForMerge(node, childIdx-1, merged.Id())
-		merged.Unpin()
-		if err != nil {
-			return nil, false, err
-		}
-		return dst, true, nil
+		return t.mergeUnderfullChildWithLeft(node, childIdx, newChild)
 	}
-
 	if childIdx < node.nCells() {
-		rightPageID := node.child(childIdx + 1)
-		rightSibling, err := t.get(rightPageID)
-		if err != nil {
-			newChild.Unpin()
-			return nil, false, err
-		}
-		merged, err := t.mergeWithRight(newChild, rightSibling, node.key(childIdx))
-		rightSibling.Unpin()
-		if err != nil {
-			newChild.Unpin()
-			return nil, false, err
-		}
-		t.txn.FreePage(rightPageID)
-		newChildID := newChild.Id()
+		return t.mergeUnderfullChildWithRight(node, childIdx, newChild)
+	}
+	return newChild, true, nil
+}
+
+func (t *BTree) mergeUnderfullChildWithLeft(node *bnode, childIdx uint16, newChild *bnode) (*bnode, bool, error) {
+	leftPageID := node.child(childIdx - 1)
+	leftSibling, err := t.get(leftPageID)
+	if err != nil {
 		newChild.Unpin()
-		t.txn.FreePage(newChildID)
-		dst, err := t.rebuildParentForMerge(node, childIdx, merged.Id())
-		merged.Unpin()
-		if err != nil {
-			return nil, false, err
-		}
-		return dst, true, nil
+		return nil, false, err
 	}
 
-	return newChild, true, nil
+	merged, err := t.mergeWithLeft(leftSibling, node.key(childIdx-1), newChild)
+	leftSibling.Unpin()
+	if err != nil {
+		newChild.Unpin()
+		return nil, false, err
+	}
+
+	t.txn.FreePage(leftPageID)
+	newChildID := newChild.Id()
+	newChild.Unpin()
+	t.txn.FreePage(newChildID)
+
+	dst, err := t.rebuildParentForMerge(node, childIdx-1, merged.Id())
+	merged.Unpin()
+	if err != nil {
+		return nil, false, err
+	}
+	return dst, true, nil
+}
+
+func (t *BTree) mergeUnderfullChildWithRight(node *bnode, childIdx uint16, newChild *bnode) (*bnode, bool, error) {
+	rightPageID := node.child(childIdx + 1)
+	rightSibling, err := t.get(rightPageID)
+	if err != nil {
+		newChild.Unpin()
+		return nil, false, err
+	}
+
+	merged, err := t.mergeWithRight(newChild, rightSibling, node.key(childIdx))
+	rightSibling.Unpin()
+	if err != nil {
+		newChild.Unpin()
+		return nil, false, err
+	}
+
+	t.txn.FreePage(rightPageID)
+	newChildID := newChild.Id()
+	newChild.Unpin()
+	t.txn.FreePage(newChildID)
+
+	dst, err := t.rebuildParentForMerge(node, childIdx, merged.Id())
+	merged.Unpin()
+	if err != nil {
+		return nil, false, err
+	}
+	return dst, true, nil
 }
 
 func siblingCanDonate(sibling *bnode) bool {

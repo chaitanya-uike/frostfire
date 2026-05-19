@@ -16,10 +16,13 @@ const (
 var (
 	ErrKeyExists   = errors.New("frostfire: key already exists")
 	ErrKeyNotFound = errors.New("frostfire: key not found")
+	ErrKeyTooBig   = errors.New("frostfire: key exceeds max size")
 )
 
 func (t *BTree) Update(key, value []byte, mode Mode) (PageId, error) {
-	assert(len(key) <= maxKeySize, "key too large")
+	if len(key) > maxKeySize {
+		return 0, ErrKeyTooBig
+	}
 
 	if t.root == 0 {
 		if mode == ModeUpdate {

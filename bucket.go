@@ -58,6 +58,13 @@ func (b *Bucket) Delete(key []byte) error {
 	return err
 }
 
+func (b *Bucket) BeginBulkLoad(opts BulkLoadOptions) (*BulkLoader, error) {
+	if b.dropped {
+		return nil, ErrBucketNotFound
+	}
+	return b.bt.BeginBulkLoad(opts)
+}
+
 func (t *Txn) Bucket(name []byte) (*Bucket, error) {
 	if t.closed {
 		return nil, ErrTxnClosed

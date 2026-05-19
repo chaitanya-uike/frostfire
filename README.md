@@ -165,6 +165,45 @@ Keys are compared lexicographically as raw bytes. If you encode numbers or
 compound keys, use an encoding that preserves the order you want when compared
 byte by byte.
 
+### Bulk Loading
+
+When initially populating an empty bucket from sorted input, `BeginBulkLoad`
+constructs the B+tree bottom-up without copy-on-write. Bulk Loading is faster than calling `Put` in a loop.
+
+```go
+bl, err := b.BeginBulkLoad(frostfire.BulkLoadOptions{FillFactor: 0.7})
+if err != nil {
+    return err
+}
+for _, item := range sortedItems {
+    if err := bl.Append(item.Key, item.Value); err != nil {
+        bl.Abort()
+        return err
+    }
+}
+if _, err := bl.Finish(); err != nil {
+    return err
+}
+```
+
+Contract:
+
+- The bucket's B+tree must be empty when `BeginBulkLoad` is called. Otherwise
+  it returns `ErrBTreeNotEmpty`.
+- Keys passed to `Append` must be strictly increasing. Out-of-order keys
+  return `ErrBulkLoaderKeyOrder`.
+- The caller must not allow concurrent readers of this bucket until `Finish`
+  has been called. Inside a single write transaction this is automatic; if
+  you fan out work across goroutines, hold all bucket access in one of them.
+- Call `Finish` to publish the new tree, or `Abort` to discard it. After
+  either, the `BulkLoader` is dead.
+
+`BulkLoadOptions.FillFactor` controls how full each new page is packed before
+rolling to a sibling. The default (`0`) is `0.7`, which leaves headroom for
+subsequent random writes without immediately splitting pages. `1.0` packs to
+maximum density (best for read-only snapshots, worst for further writes).
+Values are clamped to `[0.3, 1.0]`.
+
 ### Iteration
 
 Each bucket exposes a cursor that walks its keys in sorted order:
@@ -230,6 +269,12 @@ pages are copied as their child pointers and separator keys change.
 
 The old pages are not overwritten. They remain valid for any read transaction
 that started before the writer committed.
+
+Bulk loading is the one exception. `BeginBulkLoad` requires an empty B+tree,
+so no reader can be holding any of its pages, and the loader writes cells
+directly into freshly allocated pages instead of allocating-then-copying on
+every insert. The resulting tree shape is identical to what a sequence of
+`Put` calls would produce.
 
 ### Snapshots And Page Reuse
 
